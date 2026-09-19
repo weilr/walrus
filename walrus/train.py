@@ -51,7 +51,8 @@ def load_from_coalesced_checkpoint(
 ):
     """Load model weights from a coalesced checkpoint, aligning field indices if necessary."""
     logger.info(f"Loading coalesced checkpoint {coalesced_checkpoint_path}")
-    checkpoint = torch.load(coalesced_checkpoint_path, map_location="cpu")
+    # mmap=True: lazily page the file in instead of materialising a second full copy in RAM.
+    checkpoint = torch.load(coalesced_checkpoint_path, map_location="cpu", mmap=True)
     # Load the model weights
     model_checkpoint = checkpoint["app"]["model"]
     if align_fields and field_to_index_map != old_field_index_map:

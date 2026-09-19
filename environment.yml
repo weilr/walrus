@@ -1,0 +1,18 @@
+# Reproducible conda environment for Walrus training / fine-tuning (Windows, CUDA GPU).
+#
+# Recreate the exact environment with:
+#   conda env create -f environment.yml
+#   conda activate walrus
+#   pip install -r requirements-lock.txt --extra-index-url https://download.pytorch.org/whl/cu124
+#   pip install -e . --no-deps
+#
+# Notes:
+# - torch==2.5.1+cu124 wheels come from the PyTorch pip index (the extra-index-url above),
+#   which is why PyTorch is NOT listed as a conda dependency here.
+# - requirements-lock.txt pins every pip package, including the_well at an exact git commit.
+name: walrus
+channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
+dependencies:
+  - python=3.11
+  - pip
