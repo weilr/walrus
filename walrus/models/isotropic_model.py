@@ -1,7 +1,7 @@
 from dataclasses import replace
 from functools import reduce
 from operator import mul
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -71,6 +71,7 @@ class IsotropicModel(nn.Module):
         ] = 0,  # Temporary due to FSDP resume issue
         dim_key_override: Optional[int] = None,  # Temporary due to FSDP resume issue
         norm_layer: Callable = RMSGroupNorm,
+        explicit_patch_strides: Optional[Sequence[Sequence[int]]] = None,
         *args,
         **kwargs,
     ):
@@ -83,6 +84,23 @@ class IsotropicModel(nn.Module):
         self.gradient_checkpointing_freq = gradient_checkpointing_freq
         self.override_dimensionality = override_dimensionality
         self.dim_key_override = dim_key_override
+        # Each spatial axis specifies the strides of the two encoder stages.
+        # An explicit policy permits anisotropic grids outside the default
+        # deterministic patch lookup, without changing checkpoint parameters.
+        self.explicit_patch_strides = None
+        if explicit_patch_strides is not None:
+            if len(explicit_patch_strides) != max_d or any(
+                len(axis) != 2
+                or any(isinstance(s, bool) or int(s) != s or s < 1 for s in axis)
+                for axis in explicit_patch_strides
+            ):
+                raise ValueError(
+                    "explicit_patch_strides must contain two positive integer "
+                    "strides for each spatial axis"
+                )
+            self.explicit_patch_strides = tuple(
+                tuple(int(s) for s in axis) for axis in explicit_patch_strides
+            )
         self.encoder_dummy = nn.Parameter(
             torch.ones(1)
         )  # for grad checkpointing, see: https://discuss.pytorch.org/t/checkpoint-with-no-grad-requiring-inputs-problem/19117/11
@@ -306,7 +324,22 @@ class IsotropicModel(nn.Module):
             x = rearrange(x, "(t b) c h w d -> t b c h w d", t=T)
             x_shape = x.shape[3:]
         # Choose the variable patches if applicable
-        if (
+        if self.explicit_patch_strides is not None:
+            if not hasattr(self.embed[dim_key], "variable_downsample"):
+                raise ValueError(
+                    "explicit_patch_strides requires a variable-stride encoder"
+                )
+            dynamic_ks = self.explicit_patch_strides
+            patch_size = [reduce(mul, k) for k in dynamic_ks]
+            if any(
+                size != 1 and size % patch != 0
+                for size, patch in zip(x_shape, patch_size)
+            ):
+                raise ValueError(
+                    f"Spatial shape {tuple(x_shape)} must be divisible by explicit "
+                    f"patch sizes {tuple(patch_size)}"
+                )
+        elif (
             hasattr(self.embed[dim_key], "variable_downsample")
             and (self.embed[dim_key].variable_downsample)
             and self.embed[dim_key].variable_deterministic_ds

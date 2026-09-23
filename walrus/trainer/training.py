@@ -176,6 +176,8 @@ class Trainer:
         start_val_loss: Optional[float] = None,
         epsilon: float = 1e-5,
         validation_epsilon: float = 1e-5,
+        enable_rollout: bool = True,
+        validation_selection_metric: Optional[str] = None,
     ):
         """
         Class in charge of the training loop. It performs train, validation and test.
@@ -280,6 +282,13 @@ class Trainer:
             A small float added to denominators in denominators during training for numerical stability. Reasonably varies between runs.
         validation_epsilon:
             A small float added to denominators in loss functions during validation for numerical stability. Should be kept consistent across runs.
+        enable_rollout:
+            If False, only accept one output step and skip temporal rollout loaders
+            and evaluation. Useful for static conditional field prediction.
+        validation_selection_metric:
+            Metric class name used to select the best checkpoint, averaged over
+            fields and datasets. None preserves selection using loss_fn. The
+            requested metric must be included in validation_suite or be loss_fn.
         """
         self.experiment_name = experiment_name
         self.viz_folder = viz_folder
@@ -301,6 +310,18 @@ class Trainer:
         self.skip_checkpointing = skip_checkpointing
         self.validation_suite = validation_suite
         self.validation_suite.append(self.loss_fn)
+        self.validation_selection_metric = validation_selection_metric
+        available_metrics = {
+            metric.__class__.__name__ for metric in self.validation_suite
+        }
+        if (
+            validation_selection_metric is not None
+            and validation_selection_metric not in available_metrics
+        ):
+            raise ValueError(
+                f"validation_selection_metric={validation_selection_metric!r} is "
+                f"not available; configured metrics: {sorted(available_metrics)}"
+            )
         self.validation_trajectory_metrics = validation_trajectory_metrics
         self.batch_aggregation_fns = batch_aggregation_fns
         self.skip_spectral_metrics = skip_spectral_metrics
@@ -312,6 +333,7 @@ class Trainer:
         self.val_frequency = val_frequency
         self.rollout_val_frequency = rollout_val_frequency
         self.max_rollout_steps = max_rollout_steps
+        self.enable_rollout = enable_rollout
         self.short_validation_length = short_validation_length
         self.num_time_intervals = num_time_intervals
         self.enable_amp = enable_amp
@@ -432,6 +454,8 @@ class Trainer:
             predict_delta=self.prediction_type == "delta",
             train=train,
         )
+        if not self.enable_rollout and y_ref.shape[1] != 1:
+            raise ValueError("enable_rollout=False requires exactly one output step")
 
         # Inputs T B C H [W D], y_ref B T H [W D] C
         # If causal, during training don't include initial context in rollout length
@@ -939,16 +963,23 @@ class Trainer:
         else:  # If we're not distributed, just use the local rank dict
             loss_dict = rank_loss_dict
             time_logs = rank_time_logs
-        # Single score validation loss is average of all losses on the training metric
+        # Checkpoint selection may use a dimensionless metric while all physical
+        # per-field validation metrics remain in the reported loss dictionary.
+        selection_metric = (
+            self.validation_selection_metric or self.loss_fn.__class__.__name__
+        )
+        selection_keys = [
+            f"{metadata.dataset_name}/full_{selection_metric}_T=all"
+            for metadata in metadatas
+        ]
+        missing_keys = [key for key in selection_keys if key not in loss_dict]
+        if missing_keys:
+            raise ValueError(
+                f"Validation selection metric {selection_metric!r} produced no "
+                f"aggregate for: {missing_keys}"
+            )
         validation_loss = sum(
-            [
-                loss_dict[
-                    f"{metadata.dataset_name}/full_{self.loss_fn.__class__.__name__}_T=all"
-                ]
-                .mean()
-                .item()  # Losses should all be B sized
-                for metadata in metadatas
-            ]
+            loss_dict[key].mean().item() for key in selection_keys
         ) / len(metadatas)
         aggregated_losses = {}
         aggregated_time_logs = {}
@@ -1214,7 +1245,7 @@ class Trainer:
                 wandb.log(loss_dict)
 
         # Rollout if frequency, last epoch, or if this is the test set
-        if (
+        if self.enable_rollout and (
             epoch % self.rollout_val_frequency == 0
             or epoch >= self.max_epoch
             or is_test
@@ -1272,10 +1303,14 @@ class Trainer:
                 rank=self.rank_in_sync_group,
                 full=(epoch >= self.max_epoch and not self.debug_mode),
             )
-            rollout_val_dataloaders = self.datamodule.rollout_val_dataloaders(
-                replicas=self.sync_group_size,
-                rank=self.rank_in_sync_group,
-                full=(epoch >= self.max_epoch and not self.debug_mode),
+            rollout_val_dataloaders = (
+                self.datamodule.rollout_val_dataloaders(
+                    replicas=self.sync_group_size,
+                    rank=self.rank_in_sync_group,
+                    full=(epoch >= self.max_epoch and not self.debug_mode),
+                )
+                if self.enable_rollout
+                else []
             )
             maybe_val_loss, rollout_loss = self.validate_if_necessary(
                 epoch, val_dataloders, rollout_val_dataloaders
@@ -1295,10 +1330,14 @@ class Trainer:
         test_dataloaders = self.datamodule.test_dataloaders(
             self.sync_group_size, rank=self.rank_in_sync_group, full=not self.debug_mode
         )
-        rollout_test_dataloaders = self.datamodule.rollout_test_dataloaders(
-            replicas=self.sync_group_size,
-            rank=self.rank_in_sync_group,
-            full=not self.debug_mode,
+        rollout_test_dataloaders = (
+            self.datamodule.rollout_test_dataloaders(
+                replicas=self.sync_group_size,
+                rank=self.rank_in_sync_group,
+                full=not self.debug_mode,
+            )
+            if self.enable_rollout
+            else []
         )
         self.validate_if_necessary(
             epoch, test_dataloaders, rollout_test_dataloaders, valid_or_test="test"
@@ -1311,20 +1350,28 @@ class Trainer:
             rank=self.rank_in_sync_group,
             full=not self.debug_mode,
         )
-        rollout_val_dataloaders = self.datamodule.rollout_val_dataloaders(
-            replicas=self.sync_group_size,
-            rank=self.rank_in_sync_group,
-            full=not self.debug_mode,
+        rollout_val_dataloaders = (
+            self.datamodule.rollout_val_dataloaders(
+                replicas=self.sync_group_size,
+                rank=self.rank_in_sync_group,
+                full=not self.debug_mode,
+            )
+            if self.enable_rollout
+            else []
         )
         test_dataloaders = self.datamodule.test_dataloaders(
             replicas=self.sync_group_size,
             rank=self.rank_in_sync_group,
             full=not self.debug_mode,
         )
-        rollout_test_dataloaders = self.datamodule.rollout_test_dataloaders(
-            replicas=self.sync_group_size,
-            rank=self.rank_in_sync_group,
-            full=not self.debug_mode,
+        rollout_test_dataloaders = (
+            self.datamodule.rollout_test_dataloaders(
+                replicas=self.sync_group_size,
+                rank=self.rank_in_sync_group,
+                full=not self.debug_mode,
+            )
+            if self.enable_rollout
+            else []
         )
         # Run validation and test
         self.validate_if_necessary(
