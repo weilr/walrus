@@ -454,7 +454,8 @@ class Trainer:
             predict_delta=self.prediction_type == "delta",
             train=train,
         )
-        if not self.enable_rollout and y_ref.shape[1] != 1:
+        # Causal training targets also cover the input frames, so check the data.
+        if not self.enable_rollout and batch["output_fields"].shape[1] != 1:
             raise ValueError("enable_rollout=False requires exactly one output step")
 
         # Inputs T B C H [W D], y_ref B T H [W D] C

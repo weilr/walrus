@@ -72,6 +72,7 @@ class IsotropicModel(nn.Module):
         dim_key_override: Optional[int] = None,  # Temporary due to FSDP resume issue
         norm_layer: Callable = RMSGroupNorm,
         explicit_patch_strides: Optional[Sequence[Sequence[int]]] = None,
+        pad_to_patch_multiple: bool = False,
         *args,
         **kwargs,
     ):
@@ -101,6 +102,12 @@ class IsotropicModel(nn.Module):
             self.explicit_patch_strides = tuple(
                 tuple(int(s) for s in axis) for axis in explicit_patch_strides
             )
+        # Grids that are not a multiple of the explicit patch size are padded at
+        # the high end of each axis by edge replication, and the output is cropped
+        # back, so every output point corresponds to an input grid point.
+        if pad_to_patch_multiple and self.explicit_patch_strides is None:
+            raise ValueError("pad_to_patch_multiple requires explicit_patch_strides")
+        self.pad_to_patch_multiple = bool(pad_to_patch_multiple)
         self.encoder_dummy = nn.Parameter(
             torch.ones(1)
         )  # for grad checkpointing, see: https://discuss.pytorch.org/t/checkpoint-with-no-grad-requiring-inputs-problem/19117/11
@@ -311,6 +318,7 @@ class IsotropicModel(nn.Module):
 
         dynamic_ks = []
         patch_size = []
+        crop_shape = None
 
         if metadata.dataset_name == "post_neutron_star_merger":
             # Neutron star has a size 66 dimension - just interpolate to 64 for simplicity
@@ -331,14 +339,25 @@ class IsotropicModel(nn.Module):
                 )
             dynamic_ks = self.explicit_patch_strides
             patch_size = [reduce(mul, k) for k in dynamic_ks]
-            if any(
-                size != 1 and size % patch != 0
+            padding = [
+                0 if size == 1 else -size % patch
                 for size, patch in zip(x_shape, patch_size)
-            ):
-                raise ValueError(
-                    f"Spatial shape {tuple(x_shape)} must be divisible by explicit "
-                    f"patch sizes {tuple(patch_size)}"
+            ]
+            if any(padding):
+                if not self.pad_to_patch_multiple:
+                    raise ValueError(
+                        f"Spatial shape {tuple(x_shape)} must be divisible by explicit "
+                        f"patch sizes {tuple(patch_size)}"
+                    )
+                crop_shape = tuple(x_shape)
+                x = rearrange(x, "t b c h w d -> (t b) c h w d")
+                x = F.pad(
+                    x,
+                    (0, padding[2], 0, padding[1], 0, padding[0]),
+                    mode="replicate",
                 )
+                x = rearrange(x, "(t b) c h w d -> t b c h w d", t=T)
+                x_shape = x.shape[3:]
         elif (
             hasattr(self.embed[dim_key], "variable_downsample")
             and (self.embed[dim_key].variable_downsample)
@@ -445,6 +464,10 @@ class IsotropicModel(nn.Module):
             x = self._decoder_forward(
                 x, state_labels, bcs, stage_info, jitter_info, metadata
             )
+
+        # Remove the patch padding first; crop_shape is the grid the encoder saw.
+        if crop_shape is not None:
+            x = x[..., : crop_shape[0], : crop_shape[1], : crop_shape[2]]
 
         # If neutron star, interpolate back to original size
         if metadata.dataset_name == "post_neutron_star_merger":

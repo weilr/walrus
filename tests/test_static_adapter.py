@@ -1,11 +1,13 @@
 """Static field prediction must preserve shape, labels and physical output units."""
 
+from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
+import torch.nn.functional as F
 from the_well.benchmark.metrics import MAE, NRMSE, VRMSE
 from the_well.data.datasets import BoundaryCondition, WellMetadata
 
@@ -156,6 +158,48 @@ def test_default_patch_selection_and_checkpoint_parameters_are_unchanged():
         actual = explicit(fields, labels, bcs, metadata(shape))
     torch.testing.assert_close(actual, expected)
     assert actual.shape == fields.shape
+
+
+def test_padding_to_patch_multiple_matches_a_prepadded_grid():
+    torch.manual_seed(3)
+    strides = ((2, 2), (2, 2), (1, 1))
+    model = small_model(
+        explicit_patch_strides=strides, pad_to_patch_multiple=True
+    ).eval()
+    shape, padded_shape = (18, 10, 1), (20, 12, 1)
+    fields = torch.randn(1, 1, 6, *shape)
+    prepadded = F.pad(fields[0], (0, 0, 0, 2, 0, 2), mode="replicate")[None]
+    labels = torch.arange(3, 9)
+    bcs = [[[BoundaryCondition.OPEN.value] * 2 for _ in range(3)]]
+    with torch.no_grad():
+        actual = model(fields, labels, bcs, metadata(shape))
+        expected = model(prepadded, labels, bcs, metadata(padded_shape))
+    assert actual.shape == fields.shape
+    torch.testing.assert_close(actual, expected[..., :18, :10, :])
+    model.pad_to_patch_multiple = False
+    with pytest.raises(ValueError, match="must be divisible"):
+        model(fields, labels, bcs, metadata(shape))
+
+
+def test_padding_is_removed_before_the_neutron_star_depth_is_restored():
+    # The model resizes this dataset's depth 66 to 64 and back; padding the
+    # 18x10 mesh to 20x12 must not change the restored output shape.
+    torch.manual_seed(4)
+    model = small_model(
+        explicit_patch_strides=((2, 2), (2, 2), (2, 2)), pad_to_patch_multiple=True
+    ).eval()
+    shape = (18, 10, 66)
+    fields = torch.randn(1, 1, 6, *shape)
+    bcs = [[[BoundaryCondition.OPEN.value] * 2 for _ in range(3)]]
+    meta = replace(metadata(shape), dataset_name="post_neutron_star_merger")
+    with torch.no_grad():
+        output = model(fields, torch.arange(3, 9), bcs, meta)
+    assert output.shape == fields.shape
+
+
+def test_padding_to_patch_multiple_requires_explicit_strides():
+    with pytest.raises(ValueError, match="requires explicit_patch_strides"):
+        small_model(pad_to_patch_multiple=True)
 
 
 @pytest.mark.parametrize("invalid", [((2, 2),), ((0, 2),) * 3, ((1.5, 2),) * 3])
