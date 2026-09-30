@@ -27,6 +27,7 @@ from walrus.utils.experiment_utils import (
     align_checkpoint_with_field_to_index_map,
     configure_experiment,
 )
+from walrus.utils.seeding import seed_training_rng
 
 logger = logging.getLogger("walrus")
 # logger.setLevel(level=logging.DEBUG)
@@ -81,6 +82,10 @@ def train(
     device_mesh: Optional[torch.distributed.device_mesh.DeviceMesh] = None,
 ):
     """Instantiate the different objects required for training and run the training loop."""
+    seed = cfg.get("seed")
+    if seed is not None:
+        seed_training_rng(seed)
+        logger.info("Training random seed: %d (Python, NumPy, PyTorch CPU/CUDA)", seed)
     logger.info(f"Instantiate datamodule {cfg.data.wandb_data_name}")
     datamodule: MixedWellDataModule = instantiate(
         cfg.data.module_parameters,
